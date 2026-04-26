@@ -1,9 +1,10 @@
 // ==UserScript==
-// @name         厦门理工高校邦考试AI (DeepSeek)
+// @name         厦门理工高校邦小测AI助手
 // @namespace    https://github.com/Wu557666/gaoxiaobangai
-// @version      1.1.1
-// @description  在高校邦考试/测验页面调用 DeepSeek API 自动答题，支持自定义 API 地址
+// @version      2.1.1
+// @description  支持超时控制、自动重试、实时进度显示，极速并发答题
 // @author       Wu557666
+// @icon         https://favicon.im/xmut.gaoxiaobang.com?size=128
 // @match        https://xmut.class.gaoxiaobang.com/class/*/exam/*
 // @match        https://xmut.class.gaoxiaobang.com/class/*/quiz/*
 // @grant        GM_setValue
@@ -11,312 +12,389 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @connect      api.deepseek.com
-// @connect      api.deepseek.com
 // @run-at       document-idle
 // ==/UserScript==
 
 (function() {
     'use strict';
 
+    const $ = window.$;
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+
     // ========== 默认配置 ==========
     const DEFAULT_API_URL = 'https://api.deepseek.com/chat/completions';
     const DEFAULT_MODEL = 'deepseek-chat';
+    const DEFAULT_TIMEOUT = 15000; // 15秒
+    const DEFAULT_RETRY = 1; // 重试1次
+    const DEFAULT_INTERVAL = 300;
 
-    // ========== 存储键名 ==========
     const STORAGE_API_KEY = 'deepseek_api_key';
     const STORAGE_API_URL = 'deepseek_api_url';
     const STORAGE_MODEL = 'deepseek_model';
+    const STORAGE_INTERVAL = 'deepseek_interval';
+    const STORAGE_TIMEOUT = 'deepseek_timeout';
+    const STORAGE_RETRY = 'deepseek_retry';
 
-    // ========== 获取配置 ==========
-    function getApiKey() {
-        return GM_getValue(STORAGE_API_KEY, '');
-    }
+    // ========== 配置读写 ==========
+    function getApiKey() { return GM_getValue(STORAGE_API_KEY, ''); }
+    function setApiKey(key) { GM_setValue(STORAGE_API_KEY, key); }
+    function getApiUrl() { return GM_getValue(STORAGE_API_URL, DEFAULT_API_URL); }
+    function setApiUrl(url) { GM_setValue(STORAGE_API_URL, url); }
+    function getModel() { return GM_getValue(STORAGE_MODEL, DEFAULT_MODEL); }
+    function setModel(model) { GM_setValue(STORAGE_MODEL, model); }
+    function getInterval() { return parseInt(GM_getValue(STORAGE_INTERVAL, DEFAULT_INTERVAL), 10); }
+    function setIntervalMs(ms) { GM_setValue(STORAGE_INTERVAL, ms); }
+    function getTimeout() { return parseInt(GM_getValue(STORAGE_TIMEOUT, DEFAULT_TIMEOUT), 10); }
+    function setTimeoutMs(ms) { GM_setValue(STORAGE_TIMEOUT, ms); }
+    function getRetry() { return parseInt(GM_getValue(STORAGE_RETRY, DEFAULT_RETRY), 10); }
+    function setRetry(count) { GM_setValue(STORAGE_RETRY, count); }
 
-    function setApiKey(key) {
-        GM_setValue(STORAGE_API_KEY, key);
-    }
+    // ========== 设置面板（增加超时和重试） ==========
+    function showSettingsPanel() {
+        const oldOverlay = document.getElementById('ai-settings-overlay');
+        if (oldOverlay) oldOverlay.remove();
 
-    function getApiUrl() {
-        return GM_getValue(STORAGE_API_URL, DEFAULT_API_URL);
-    }
+        const apiKey = getApiKey();
+        const apiUrl = getApiUrl();
+        const model = getModel();
+        const interval = getInterval();
+        const timeout = getTimeout();
+        const retry = getRetry();
 
-    function setApiUrl(url) {
-        GM_setValue(STORAGE_API_URL, url);
-    }
+        const overlay = document.createElement('div');
+        overlay.id = 'ai-settings-overlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;';
 
-    function getModel() {
-        return GM_getValue(STORAGE_MODEL, DEFAULT_MODEL);
-    }
+        const panel = document.createElement('div');
+        panel.id = 'ai-settings-panel';
+        panel.style.cssText = 'background:white;padding:24px;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,0.3);width:420px;max-width:90vw;font-family:Arial,sans-serif;';
 
-    function setModel(model) {
-        GM_setValue(STORAGE_MODEL, model);
-    }
+        panel.innerHTML = `
+            <h2 style="margin:0 0 16px;color:#1fb6ff;font-size:20px;">🤖 考试 AI 助手设置</h2>
+            <p style="margin:0 0 20px;color:#666;font-size:14px;">请输入你的 DeepSeek API Key（<a href="https://platform.deepseek.com/" target="_blank" style="color:#1fb6ff;">点击获取</a>）</p>
+            
+            <label style="display:block;margin-bottom:6px;font-weight:bold;color:#333;">API Key <span style="color:red;">*</span></label>
+            <input type="password" id="ai-api-key-input" placeholder="sk-xxxxxxxx" value="${apiKey}" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;box-sizing:border-box;margin-bottom:16px;">
+            
+            <details style="margin-bottom:20px;">
+                <summary style="cursor:pointer;color:#1fb6ff;font-size:14px;">高级设置（可选）</summary>
+                <div style="margin-top:12px;">
+                    <label style="display:block;margin-bottom:6px;font-weight:bold;color:#333;">API 地址</label>
+                    <input type="text" id="ai-api-url-input" placeholder="${DEFAULT_API_URL}" value="${apiUrl}" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;box-sizing:border-box;margin-bottom:12px;">
+                    
+                    <label style="display:block;margin-bottom:6px;font-weight:bold;color:#333;">模型名称</label>
+                    <input type="text" id="ai-model-input" placeholder="${DEFAULT_MODEL}" value="${model}" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;box-sizing:border-box;margin-bottom:12px;">
+                    
+                    <label style="display:block;margin-bottom:6px;font-weight:bold;color:#333;">请求超时(毫秒)</label>
+                    <input type="number" id="ai-timeout-input" value="${timeout}" min="3000" max="60000" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;box-sizing:border-box;margin-bottom:12px;">
+                    
+                    <label style="display:block;margin-bottom:6px;font-weight:bold;color:#333;">失败重试次数</label>
+                    <input type="number" id="ai-retry-input" value="${retry}" min="0" max="3" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;box-sizing:border-box;margin-bottom:12px;">
+                    
+                    <label style="display:block;margin-bottom:6px;font-weight:bold;color:#333;">题目间延迟(毫秒)</label>
+                    <input type="number" id="ai-interval-input" value="${interval}" min="0" max="3000" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;box-sizing:border-box;">
+                </div>
+            </details>
+            
+            <div style="display:flex;gap:12px;justify-content:flex-end;">
+                <button id="ai-settings-cancel" style="padding:10px 20px;border:none;border-radius:8px;background:#f0f0f0;color:#666;cursor:pointer;font-size:14px;">取消</button>
+                <button id="ai-settings-save" style="padding:10px 20px;border:none;border-radius:8px;background:#1fb6ff;color:white;cursor:pointer;font-size:14px;font-weight:bold;">保存并启用</button>
+            </div>
+        `;
 
-    // ========== 菜单命令 ==========
-    // 1. 设置 API Key
-    GM_registerMenuCommand('🔑 设置 DeepSeek API Key', function() {
-        const currentKey = getApiKey();
-        const newKey = prompt('请输入你的 DeepSeek API Key：', currentKey || '');
-        if (newKey !== null) {
-            if (newKey.trim()) {
-                setApiKey(newKey.trim());
-                alert('✅ API Key 已保存！');
-            } else {
-                alert('❌ API Key 不能为空');
+        overlay.appendChild(panel);
+        document.body.appendChild(overlay);
+
+        document.getElementById('ai-settings-cancel').onclick = () => {
+            overlay.remove();
+            if (!getApiKey()) {
+                const tip = document.createElement('div');
+                tip.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:9999;background:#ff9800;color:white;padding:10px 15px;border-radius:8px;';
+                tip.innerText = '⚠️ 未设置 API Key，无法使用';
+                document.body.appendChild(tip);
+                setTimeout(() => tip.remove(), 3000);
             }
-        }
-    });
+        };
 
-    // 2. 设置 API 地址
-    GM_registerMenuCommand('🌐 设置 API 地址', function() {
-        const currentUrl = getApiUrl();
-        const newUrl = prompt('请输入 DeepSeek API 完整地址（包含 /chat/completions）：', currentUrl);
-        if (newUrl !== null) {
-            if (newUrl.trim()) {
-                setApiUrl(newUrl.trim());
-                alert('✅ API 地址已保存！\n\n⚠️ 如果使用非官方域名，请确保脚本头部 @connect 已添加对应域名，否则请求会被阻止。');
-            } else {
-                setApiUrl(DEFAULT_API_URL);
-                alert('✅ 已恢复为官方 API 地址');
+        document.getElementById('ai-settings-save').onclick = () => {
+            const newKey = document.getElementById('ai-api-key-input').value.trim();
+            const newUrl = document.getElementById('ai-api-url-input').value.trim();
+            const newModel = document.getElementById('ai-model-input').value.trim();
+            const newTimeout = document.getElementById('ai-timeout-input').value.trim();
+            const newRetry = document.getElementById('ai-retry-input').value.trim();
+            const newInterval = document.getElementById('ai-interval-input').value.trim();
+
+            if (!newKey) {
+                alert('❌ API Key 不能为空！');
+                return;
             }
-        }
-    });
 
-    // 3. 设置模型名称（可选）
-    GM_registerMenuCommand('🤖 设置模型名称', function() {
-        const currentModel = getModel();
-        const newModel = prompt('请输入模型名称（如 deepseek-chat, deepseek-reasoner 等）：', currentModel);
-        if (newModel !== null) {
-            if (newModel.trim()) {
-                setModel(newModel.trim());
-                alert('✅ 模型已设置为：' + newModel.trim());
-            } else {
-                setModel(DEFAULT_MODEL);
-                alert('✅ 已恢复为默认模型：' + DEFAULT_MODEL);
-            }
-        }
-    });
+            setApiKey(newKey);
+            if (newUrl) setApiUrl(newUrl);
+            if (newModel) setModel(newModel);
+            if (newTimeout) setTimeoutMs(newTimeout);
+            if (newRetry) setRetry(newRetry);
+            if (newInterval) setIntervalMs(newInterval);
 
-    // 4. 查看当前配置
-    GM_registerMenuCommand('📋 查看当前配置', function() {
+            overlay.remove();
+            alert('✅ 配置已保存！现在可以使用 AI 答题了。');
+            location.reload();
+        };
+    }
+
+    GM_registerMenuCommand('⚙️ 打开设置面板', showSettingsPanel);
+    GM_registerMenuCommand('📋 查看当前配置', () => {
         const key = getApiKey();
         const url = getApiUrl();
         const model = getModel();
+        const timeout = getTimeout();
+        const retry = getRetry();
+        const interval = getInterval();
         const keyPreview = key ? key.slice(0, 8) + '...' + key.slice(-4) : '未设置';
-        alert(`当前配置：\n\nAPI Key: ${keyPreview}\nAPI 地址: ${url}\n模型: ${model}`);
+        alert(`当前配置：\n\nAPI Key: ${keyPreview}\nAPI 地址: ${url}\n模型: ${model}\n超时: ${timeout}ms\n重试: ${retry}次\n间隔: ${interval}ms`);
     });
 
-    // 5. 重置所有配置
-    GM_registerMenuCommand('🔄 重置所有配置', function() {
-        if (confirm('确定要清除所有配置（API Key、地址、模型）吗？')) {
-            GM_deleteValue(STORAGE_API_KEY);
-            GM_deleteValue(STORAGE_API_URL);
-            GM_deleteValue(STORAGE_MODEL);
-            alert('✅ 已重置，刷新页面后需重新设置 API Key。');
-            location.reload();
-        }
-    });
-
-    // ========== 初始化检查 ==========
     const apiKey = getApiKey();
     if (!apiKey) {
-        console.warn('⚠️ 未设置 DeepSeek API Key，请通过脚本菜单（点击脚本管理器图标）设置。');
-        const tip = document.createElement('div');
-        tip.style.position = 'fixed';
-        tip.style.bottom = '20px';
-        tip.style.right = '20px';
-        tip.style.zIndex = 9999;
-        tip.style.background = '#ff9800';
-        tip.style.color = 'white';
-        tip.style.padding = '10px 15px';
-        tip.style.borderRadius = '8px';
-        tip.style.boxShadow = '0 2px 10px rgba(0,0,0,0.2)';
-        tip.innerText = '⚠️ 请先设置 API Key（点击脚本菜单）';
-        document.body.appendChild(tip);
+        console.warn('⚠️ 未设置 DeepSeek API Key，正在打开设置面板...');
+        setTimeout(showSettingsPanel, 1000);
         return;
     }
     console.log('✅ DeepSeek 配置已加载');
-    console.log('   API 地址:', getApiUrl());
-    console.log('   模型:', getModel());
 
-    // ========== 高校邦题目提取器 ==========
-    function extractQuestion() {
-        const selectors = [
-            '.exam-question', '.question-title', '.quiz-question',
-            '.question-content', '.subject-title', '.stem',
-            '.question-item .title', '.exam-item .title'
-        ];
-        for (let sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el) return el.innerText.trim();
-        }
-        const container = document.querySelector('.question-panel, .exam-panel, .quiz-panel, .paper-content');
-        if (container) {
-            const title = container.querySelector('h3, h4, .title, .text');
-            if (title) return title.innerText.trim();
-        }
-        return null;
+    // ========== 从全局变量读取题目数据 ==========
+    function getQuestionsFromData() {
+        return window.questionList || (typeof unsafeWindow !== 'undefined' && unsafeWindow.questionList);
     }
 
-    function extractOptions() {
-        const options = [];
-        const optionItems = document.querySelectorAll('.option-item, .exam-option, .choice-item, .question-option, li');
-        if (optionItems.length) {
-            optionItems.forEach(el => {
-                const text = el.innerText.trim();
-                if (text && /^[A-Z][\.、\s]/.test(text)) options.push(text);
-                else if (text) options.push(text);
-            });
-        } else {
-            document.querySelectorAll('label').forEach(el => {
-                const text = el.innerText.trim();
-                if (text && /^[A-Z][\.、\s]/.test(text)) options.push(text);
-            });
+    // ========== 根据 answer_id 精准点击选项 ==========
+    function selectOptionByAnswerId(answerId) {
+        if (!answerId) return false;
+        const icon = document.querySelector(`i[answer_id="${answerId}"]`);
+        if (!icon) return false;
+
+        const isSelected = icon.classList.contains('gxb-icon-radio-selected') ||
+                           icon.classList.contains('gxb-icon-check-selected') ||
+                           icon.classList.contains('selected');
+        if (isSelected) {
+            console.log(`⏭️ 选项 answer_id=${answerId} 已选中，跳过`);
+            return true;
         }
-        return [...new Set(options.filter(opt => opt.length > 0))];
+
+        ['mousedown', 'mouseup', 'click'].forEach(type => {
+            icon.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
+        });
+        console.log(`📌 已点击 answer_id=${answerId}`);
+        return true;
     }
 
-    // ========== AI 答题核心 ==========
-    async function answerCurrentQuestion() {
-        const apiKeyNow = getApiKey();
-        if (!apiKeyNow) {
-            alert('请先通过脚本菜单设置 API Key！');
-            return;
-        }
+    // ========== 带超时和重试的请求 ==========
+    function requestWithRetry(url, headers, data, timeoutMs, maxRetry) {
+        return new Promise((resolve, reject) => {
+            let retryCount = 0;
 
-        const question = extractQuestion();
-        if (!question) {
-            alert('❌ 未检测到题目，请确保在考试/测验页面');
-            return;
-        }
-        const options = extractOptions();
-        if (!options.length) {
-            alert('❌ 未检测到选项');
-            return;
-        }
+            const doRequest = () => {
+                const startTime = Date.now();
+                let timeoutId = null;
+                let isResolved = false;
 
-        const optionsText = options.map((opt, i) => `${String.fromCharCode(65 + i)}. ${opt}`).join('\n');
-        const prompt = `请回答以下题目，只返回正确答案的字母（如 A, B, C 或 AB）：\n题目：${question}\n选项：\n${optionsText}`;
+                const clean = () => {
+                    if (timeoutId) clearTimeout(timeoutId);
+                };
 
-        const apiUrl = getApiUrl();
-        const model = getModel();
+                const handleSuccess = (resp) => {
+                    if (isResolved) return;
+                    isResolved = true;
+                    clean();
+                    resolve(resp);
+                };
 
-        console.log('🤖 正在调用 AI...');
-        console.log('   API 地址:', apiUrl);
-        console.log('   模型:', model);
-        console.log('   题目:', question);
-        console.log('   选项:', optionsText);
+                const handleError = (err) => {
+                    if (isResolved) return;
+                    isResolved = true;
+                    clean();
 
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: apiUrl,
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKeyNow}`
-            },
-            data: JSON.stringify({
-                model: model,
-                messages: [
-                    { role: 'system', content: '你是一个考试答题助手，只返回正确答案的字母，不要任何解释。' },
-                    { role: 'user', content: prompt }
-                ],
-                temperature: 0.1
-            }),
-            onload: function(resp) {
-                try {
-                    const data = JSON.parse(resp.responseText);
-                    const answer = data.choices[0].message.content.trim();
-                    console.log('✅ AI 答案:', answer);
-                    selectOption(answer);
-                } catch (e) {
-                    console.error('解析 AI 响应失败:', e);
-                    alert('AI 响应解析失败，请查看控制台');
-                }
-            },
-            onerror: function(err) {
-                console.error('API 请求失败:', err);
-                alert('AI 调用失败，请检查网络或 API 地址是否正确。\n如果使用非官方域名，请确保 @connect 已添加该域名。');
-            }
+                    if (retryCount < maxRetry) {
+                        retryCount++;
+                        console.warn(`⚠️ 请求失败/超时，正在重试 (${retryCount}/${maxRetry})...`);
+                        doRequest();
+                    } else {
+                        reject(err);
+                    }
+                };
+
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: url,
+                    headers: headers,
+                    data: data,
+                    timeout: timeoutMs,
+                    onload: handleSuccess,
+                    onerror: handleError,
+                    ontimeout: () => handleError(new Error('Request timeout'))
+                });
+
+                // 额外保险：GM_xmlhttpRequest 的 timeout 可能不触发 ontimeout，手动计时
+                timeoutId = setTimeout(() => {
+                    if (!isResolved) {
+                        console.warn(`⏰ 请求超过 ${timeoutMs}ms，手动超时`);
+                        handleError(new Error('Manual timeout'));
+                    }
+                }, timeoutMs + 500);
+            };
+
+            doRequest();
         });
     }
 
-    // ========== 选项选择 ==========
-    function selectOption(answer) {
-        const letters = answer.match(/[A-D]/gi);
-        if (!letters) {
-            console.warn('⚠️ 未识别到有效答案字母:', answer);
-            alert('AI 返回的答案格式异常: ' + answer);
+    // ========== 并发批量答题（带进度显示） ==========
+    async function answerAllQuestions(statusElement) {
+        const apiKeyNow = getApiKey();
+        if (!apiKeyNow) {
+            alert('请先设置 API Key！');
+            showSettingsPanel();
             return;
         }
 
-        const optionEls = document.querySelectorAll('.option-item, .exam-option, .choice-item, .question-option');
-        if (optionEls.length) {
-            letters.forEach(letter => {
-                const index = letter.toUpperCase().charCodeAt(0) - 65;
-                if (index < optionEls.length) {
-                    const input = optionEls[index].querySelector('input[type="radio"], input[type="checkbox"]');
-                    if (input) {
-                        input.checked = true;
-                        input.click();
-                    }
-                }
-            });
-        } else {
-            const inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
-            letters.forEach(letter => {
-                const index = letter.toUpperCase().charCodeAt(0) - 65;
-                if (inputs[index]) {
-                    inputs[index].checked = true;
-                    inputs[index].click();
-                }
-            });
+        const questionData = getQuestionsFromData();
+        if (!questionData || questionData.length === 0) {
+            alert('❌ 未获取到题目数据，可能页面还未完全加载，请刷新后重试。');
+            return;
         }
-        console.log('📌 已选择:', letters.join(', '));
+
+        const apiUrl = getApiUrl();
+        const model = getModel();
+        const timeout = getTimeout();
+        const maxRetry = getRetry();
+        const interval = getInterval();
+
+        const total = questionData.length;
+        let completed = 0;
+        const updateStatus = () => {
+            if (statusElement) {
+                statusElement.innerText = `🤖 答题中 ${completed}/${total}`;
+            }
+        };
+        updateStatus();
+
+        console.log(`🎯 共 ${total} 道题目，开始并发解答（超时:${timeout}ms, 重试:${maxRetry}次）...`);
+
+        const promises = questionData.map(async (q, index) => {
+            const questionText = q.name || q.questionName;
+            const options = q.answerList || [];
+
+            if (!questionText || options.length === 0) {
+                console.warn(`⚠️ 第 ${index+1} 题数据不完整，跳过`);
+                completed++;
+                updateStatus();
+                return;
+            }
+
+            const optionsText = options.map((opt, i) =>
+                `${String.fromCharCode(65 + i)}. ${opt.text || opt}`
+            ).join('\n');
+
+            const prompt = `请回答以下题目，只返回正确答案的字母（如 A, B, C 或 AB）：\n题目：${questionText}\n选项：\n${optionsText}`;
+
+            try {
+                const resp = await requestWithRetry(
+                    apiUrl,
+                    {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKeyNow}`
+                    },
+                    JSON.stringify({
+                        model: model,
+                        messages: [
+                            { role: 'system', content: '你是一个考试答题助手，只返回正确答案的字母，不要任何解释。' },
+                            { role: 'user', content: prompt }
+                        ],
+                        temperature: 0.1
+                    }),
+                    timeout,
+                    maxRetry
+                );
+
+                const data = JSON.parse(resp.responseText);
+                const answer = data.choices[0].message.content.trim();
+                console.log(`📌 第 ${index+1} 题 AI 答案: ${answer}`);
+
+                const letters = answer.match(/[A-D]/gi);
+                if (letters) {
+                    letters.forEach(letter => {
+                        const optIndex = letter.toUpperCase().charCodeAt(0) - 65;
+                        if (optIndex < options.length) {
+                            const opt = options[optIndex];
+                            if (opt.answerId) {
+                                selectOptionByAnswerId(opt.answerId);
+                            }
+                        }
+                    });
+                } else {
+                    console.warn(`   ⚠️ 未识别到有效答案字母: ${answer}`);
+                }
+            } catch (e) {
+                console.error(`❌ 第 ${index+1} 题最终失败:`, e);
+            } finally {
+                completed++;
+                updateStatus();
+                if (interval > 0) {
+                    await wait(interval);
+                }
+            }
+        });
+
+        await Promise.all(promises);
+        if (statusElement) {
+            statusElement.innerText = '🤖 AI 就绪';
+        }
+        console.log('🎉 所有题目处理完毕！');
     }
 
-    // ========== 添加浮动控制面板 ==========
+    // ========== 浮动控制面板（带进度状态） ==========
     function addControlPanel() {
         const panel = document.createElement('div');
-        panel.style.position = 'fixed';
-        panel.style.bottom = '20px';
-        panel.style.right = '20px';
-        panel.style.zIndex = 9999;
-        panel.style.background = '#1fb6ff';
-        panel.style.color = 'white';
-        panel.style.padding = '12px 18px';
-        panel.style.borderRadius = '12px';
-        panel.style.boxShadow = '0 4px 15px rgba(0,0,0,0.2)';
-        panel.style.display = 'flex';
-        panel.style.alignItems = 'center';
-        panel.style.gap = '12px';
-        panel.style.fontFamily = 'Arial, sans-serif';
+        panel.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:9998;background:#1fb6ff;color:white;padding:12px 18px;border-radius:12px;box-shadow:0 4px 15px rgba(0,0,0,0.2);display:flex;align-items:center;gap:12px;font-family:Arial,sans-serif;';
 
         const status = document.createElement('span');
+        status.id = 'ai-answer-status';
         status.innerText = '🤖 AI 就绪';
         status.style.fontWeight = 'bold';
 
         const btn = document.createElement('button');
-        btn.innerText = '答题';
-        btn.style.background = 'white';
-        btn.style.color = '#1fb6ff';
-        btn.style.border = 'none';
-        btn.style.padding = '6px 16px';
-        btn.style.borderRadius = '6px';
-        btn.style.cursor = 'pointer';
-        btn.style.fontWeight = 'bold';
-        btn.style.fontSize = '14px';
+        btn.innerText = '答本页全部';
+        btn.style.cssText = 'background:white;color:#1fb6ff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px;';
         btn.onclick = () => {
-            status.innerText = '🤖 AI 思考中...';
-            answerCurrentQuestion().finally(() => {
-                status.innerText = '🤖 AI 就绪';
-            });
+            answerAllQuestions(status);
         };
+
+        const settingsBtn = document.createElement('button');
+        settingsBtn.innerText = '⚙️';
+        settingsBtn.style.cssText = 'background:transparent;color:white;border:none;font-size:18px;cursor:pointer;padding:0 4px;';
+        settingsBtn.title = '打开设置';
+        settingsBtn.onclick = showSettingsPanel;
 
         panel.appendChild(status);
         panel.appendChild(btn);
+        panel.appendChild(settingsBtn);
         document.body.appendChild(panel);
     }
 
-    setTimeout(addControlPanel, 1500);
+    // 等待数据出现
+    function waitForQuestionData() {
+        return new Promise(resolve => {
+            const check = () => {
+                const q = getQuestionsFromData();
+                if (q && q.length > 0) resolve();
+                else setTimeout(check, 500);
+            };
+            check();
+        });
+    }
+
+    (async function init() {
+        await waitForQuestionData();
+        addControlPanel();
+    })();
 
 })();
